@@ -57,7 +57,7 @@ async def lifespan(app: FastAPI):
     worker = get_worker()
     ws_task = asyncio.create_task(run_ws_server(), name="ext-ws-server")
     worker_task = asyncio.create_task(worker.start(), name="request-worker")
-    logger.info("flowboard agent started (ws:9222 + worker)")
+    logger.info("flowboard agent started (ws:9223 + worker)")
     try:
         yield
     finally:

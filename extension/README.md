@@ -10,7 +10,7 @@ Local extension that proxies Flowboard agent requests to authenticated labs.goog
 
 ## How it works
 
-- The service worker connects to `ws://127.0.0.1:9222` automatically when the agent is running.
+- The service worker connects to `ws://127.0.0.1:9223` automatically when the agent is running.
 - On first sign-in at `labs.google/fx/tools/flow` the `Authorization: Bearer ya29.*` token is captured automatically from outgoing request headers.
 - Responses to agent `api_request` commands are sent via HTTP POST to `http://127.0.0.1:8101/api/ext/callback` with an `X-Callback-Secret` header (secret supplied by the agent on connect). WS fallback is used if HTTP fails.
 - A keepalive `ping` is sent every ~24 s; disconnections trigger an automatic reconnect in ~5 s.

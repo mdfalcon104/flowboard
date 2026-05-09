@@ -331,7 +331,7 @@ matching vocab from the system prompt.
 │  Chrome MV3 ext      │◄───┤  FastAPI agent     ├───►│  SQLite (storage/)   │
 │  - content script    │ WS │  127.0.0.1:8101    │    │  Board, Node, Edge,  │
 │  - injected MAIN     │ ws │  + worker queue    │    │  Request, Asset,     │
-│  - CDN URL allow     │9222│  + WS server :9222 │    │  Plan, ChatMessage,  │
+│  - CDN URL allow     │9223│  + WS server :9223 │    │  Plan, ChatMessage,  │
 │  - Captcha bridge    │    │  + LLM CLI bridge  │    │  BoardFlowProject    │
 └──────────────────────┘    └─────────┬──────────┘    └──────────────────────┘
         ▲                             │

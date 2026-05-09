@@ -3,7 +3,7 @@
 Ported + trimmed from flowkit (https://github.com/crisng95/flowkit).
 
 Control flow:
-1. Extension opens WS to :9222.
+1. Extension opens WS to :9223.
 2. Agent sends ``{type:"callback_secret", secret}`` immediately.
 3. When the agent wants to make an authenticated call against Google Flow /
    aisandbox-pa, it calls ``flow_client.api_request(url, method, headers, body)``
