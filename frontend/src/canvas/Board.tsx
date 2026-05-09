@@ -27,6 +27,7 @@ const nodeTypes = {
   prompt: NodeCard,
   note: NodeCard,
   visual_asset: NodeCard,
+  Storyboard: NodeCard,
 };
 
 // Single edge type used for everything — VariantEdge renders the
