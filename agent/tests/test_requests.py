@@ -215,7 +215,7 @@ async def test_worker_gen_video_happy_path(client, monkeypatch):
             assert kwargs["start_media_id"] == "src-1"
             return {"raw": {"ok": True}, "operation_names": ["op-1"]}
 
-        async def check_async(self, names):
+        async def check_async(self, names, workflows=None):
             poll_calls["n"] += 1
             if poll_calls["n"] == 1:
                 return {
@@ -282,7 +282,7 @@ async def test_worker_gen_video_times_out(client, monkeypatch):
         async def gen_video(self, **kwargs):
             return {"raw": {}, "operation_names": ["op-never"]}
 
-        async def check_async(self, names):
+        async def check_async(self, names, workflows=None):
             return {
                 "raw": {},
                 "operations": [{"name": "op-never", "done": False, "media_entries": []}],
@@ -334,7 +334,7 @@ async def test_worker_gen_video_bails_on_per_op_error(client, monkeypatch):
         async def gen_video(self, **kwargs):
             return {"raw": {}, "operation_names": ["op-bad"]}
 
-        async def check_async(self, names):
+        async def check_async(self, names, workflows=None):
             poll_count["n"] += 1
             return {
                 "raw": {},
@@ -405,7 +405,7 @@ async def test_worker_gen_video_partial_batch_keeps_succeeded(
                 "operation_names": ["op-a", "op-b-bad", "op-c", "op-d"],
             }
 
-        async def check_async(self, names):
+        async def check_async(self, names, workflows=None):
             return {
                 "raw": {},
                 "operations": [
@@ -520,7 +520,7 @@ async def test_worker_gen_video_dedupes_repeat_entries_across_polls(
         async def gen_video(self, **kwargs):
             return {"raw": {}, "operation_names": ["op-1", "op-2", "op-3"]}
 
-        async def check_async(self, names):
+        async def check_async(self, names, workflows=None):
             poll_state["n"] += 1
             n = poll_state["n"]
             # Each op finishes on a different poll; once done it stays

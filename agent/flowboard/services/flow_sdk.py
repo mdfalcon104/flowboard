@@ -29,6 +29,13 @@ VIDEO_I2V_URL = f"{FLOW_API_BASE}/v1/video:batchAsyncGenerateVideoStartImage"
 VIDEO_POLL_URL = f"{FLOW_API_BASE}/v1/video:batchCheckAsyncVideoGenerationStatus"
 UPLOAD_IMAGE_URL = f"{FLOW_API_BASE}/v1/flow/uploadImage"
 
+
+def _media_get_url(media_id: str) -> str:
+    """Endpoint that returns inline encoded video bytes for a workflow's
+    primary media. Used to poll Low Priority (workflow-schema) submissions —
+    they have no operation name and don't appear in ``batchCheckAsync``."""
+    return f"{FLOW_API_BASE}/v1/media/{media_id}?clientContext.tool=PINHOLE"
+
 # Image model keys, indexed by the user-facing nickname used in
 # flowkit's models.json. Pro is Flow's premium / higher-quality image
 # model; "Banana 2" (NARWHAL) is the lighter / faster option. The
@@ -384,31 +391,190 @@ class FlowSDK:
         op_names = extract_operation_names(resp)
         if not op_names:
             return {"raw": resp, "error": "no_operations_in_response"}
-        return {"raw": resp, "operation_names": op_names}
+        out: dict[str, Any] = {"raw": resp, "operation_names": op_names}
+        # NEW low-priority workflow models return `data.workflows[]` with a
+        # `primaryMediaId` per workflow instead of operations. Surface the
+        # pairing so the poller can hit `/v1/media/<id>` directly.
+        workflows = extract_video_workflows(resp)
+        if workflows:
+            out["workflows"] = workflows
+        return out
 
-    async def check_async(self, operation_names: list[str]) -> dict[str, Any]:
+    async def check_async(
+        self,
+        operation_names: list[str],
+        workflows: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
         """Poll one or more video operations. No captcha.
 
         Returns ``{raw, operations: [{name, done, media_entries}]}`` — one
         entry per input operation. ``media_entries`` is a list of
         ``{media_id, url, mediaType}`` ready for ``media.ingest_urls``.
-        """
-        body = {
-            "operations": [
-                {"operation": {"name": name}} for name in operation_names
-            ]
-        }
-        resp = await self._client.api_request(
-            url=VIDEO_POLL_URL,
-            method="POST",
-            headers=dict(_API_HEADERS),
-            body=body,
-        )
-        if isinstance(resp, dict) and resp.get("error"):
-            return {"raw": resp, "error": resp["error"]}
 
-        ops_summary = extract_video_operations(resp, requested=operation_names)
-        return {"raw": resp, "operations": ops_summary}
+        ``workflows`` (optional) carries ``{name, primary_media_id}`` pairs
+        from the NEW low-priority response. When provided, every workflow
+        entry is polled against ``/v1/media/<primary_media_id>`` and the
+        result is merged into the same ``operations`` shape so the caller
+        is schema-agnostic.
+        """
+        ops_summary: list[dict[str, Any]] = []
+        raw_old: Any = None
+        # Names that came from workflows are NOT valid operation handles —
+        # don't dispatch them to batchCheckAsync (Flow would 400).
+        workflow_names = {w["name"] for w in (workflows or []) if isinstance(w, dict) and w.get("name")}
+        old_names = [n for n in operation_names if n not in workflow_names]
+        if old_names:
+            body = {
+                "operations": [
+                    {"operation": {"name": name}} for name in old_names
+                ]
+            }
+            raw_old = await self._client.api_request(
+                url=VIDEO_POLL_URL,
+                method="POST",
+                headers=dict(_API_HEADERS),
+                body=body,
+            )
+            if isinstance(raw_old, dict) and raw_old.get("error"):
+                return {"raw": raw_old, "error": raw_old["error"]}
+            ops_summary.extend(
+                extract_video_operations(raw_old, requested=old_names)
+            )
+
+        raw_workflows: list[dict[str, Any]] = []
+        if workflows:
+            wf_summary, raw_workflows = await self._poll_workflows(workflows)
+            ops_summary.extend(wf_summary)
+
+        # Preserve the original input order so callers (worker) can keep
+        # positional alignment with their per-op state.
+        order = {name: i for i, name in enumerate(operation_names)}
+        ops_summary.sort(key=lambda op: order.get(op.get("name"), 1 << 30))
+
+        raw_out: dict[str, Any] = {}
+        if raw_old is not None:
+            raw_out["operations_poll"] = raw_old
+        if raw_workflows:
+            raw_out["workflow_polls"] = raw_workflows
+        return {"raw": raw_out or raw_old, "operations": ops_summary}
+
+    async def _poll_workflows(
+        self, workflows: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Single poll pass for workflow-mode (Low Priority) submissions.
+
+        For each ``{name, primary_media_id}`` pair, GET ``/v1/media/<id>``
+        and inspect ``video.encodedVideo``. Flow returns base64-encoded MP4
+        once rendering completes; before that the payload is metadata-only
+        (small bytes, no ``ftyp`` magic) — we treat that as "still pending".
+
+        Returns ``(ops_summary, raw_polls)`` mirroring the OLD-schema
+        ``check_async`` contract: one entry per workflow with
+        ``{name, done, media_entries, status, error}``. The poll loop in
+        the worker calls this repeatedly via ``check_async`` until ``done``.
+        """
+        import base64 as _b64
+
+        ops_summary: list[dict[str, Any]] = []
+        raw_polls: list[dict[str, Any]] = []
+        for wf in workflows:
+            if not isinstance(wf, dict):
+                continue
+            name = wf.get("name")
+            mid = wf.get("primary_media_id")
+            if not isinstance(name, str) or not isinstance(mid, str) or not mid:
+                continue
+            try:
+                resp = await self._client.api_request(
+                    url=_media_get_url(mid),
+                    method="GET",
+                    headers=dict(_API_HEADERS),
+                    body=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("workflow poll error for %s: %s", mid[:8], exc)
+                ops_summary.append(
+                    {
+                        "name": name,
+                        "done": False,
+                        "media_entries": [],
+                        "status": None,
+                        "error": None,
+                    }
+                )
+                continue
+            raw_polls.append({"name": name, "media_id": mid, "resp": resp})
+
+            # Transport / API failure — keep polling. Treat 404 as "not ready"
+            # too; Flow sometimes 404s the media endpoint mid-render.
+            if not isinstance(resp, dict):
+                ops_summary.append(
+                    {"name": name, "done": False, "media_entries": [], "status": None, "error": None}
+                )
+                continue
+            status_code = resp.get("status")
+            if isinstance(status_code, int) and status_code >= 400 and status_code != 404:
+                # Surface the inner Flow error (e.g. content filter).
+                inner = _extract_inner_api_error(resp)
+                ops_summary.append(
+                    {
+                        "name": name,
+                        "done": True,
+                        "media_entries": [],
+                        "status": None,
+                        "error": inner or f"API_{status_code}",
+                    }
+                )
+                continue
+
+            # `data` is the body; for /v1/media it's the media object directly.
+            data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+            video_block = data.get("video") if isinstance(data.get("video"), dict) else {}
+            encoded = (
+                video_block.get("encodedVideo")
+                if isinstance(video_block, dict)
+                else None
+            )
+            if not isinstance(encoded, str) or not encoded:
+                ops_summary.append(
+                    {"name": name, "done": False, "media_entries": [], "status": None, "error": None}
+                )
+                continue
+            try:
+                binary = _b64.b64decode(encoded, validate=False)
+            except Exception:  # noqa: BLE001
+                ops_summary.append(
+                    {"name": name, "done": False, "media_entries": [], "status": None, "error": None}
+                )
+                continue
+            # MP4 box layout: bytes 4..8 == "ftyp" on a complete file.
+            # Until that lands, Flow returns a small metadata payload — skip.
+            is_mp4 = len(binary) >= 12 and binary[4:8] == b"ftyp"
+            if not is_mp4:
+                ops_summary.append(
+                    {"name": name, "done": False, "media_entries": [], "status": None, "error": None}
+                )
+                continue
+            fife = (
+                video_block.get("fifeUrl") if isinstance(video_block, dict) else None
+            ) or data.get("fifeUrl")
+            ops_summary.append(
+                {
+                    "name": name,
+                    "done": True,
+                    "media_entries": [
+                        {
+                            "media_id": mid,
+                            "url": fife if isinstance(fife, str) else None,
+                            "mediaType": "video",
+                            "encoded_video": encoded,
+                        }
+                    ],
+                    "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+                    "error": None,
+                }
+            )
+        return ops_summary, raw_polls
 
     # ── image generation (api_request + captcha) ───────────────────────────
     async def gen_image(
@@ -641,28 +807,77 @@ def _extract_uploaded_media_id(resp: Any) -> Optional[str]:
 
 
 def extract_operation_names(resp: Any) -> list[str]:
-    """Pull ``operation.name`` out of a ``batchAsyncGenerateVideo*`` response."""
+    """Pull ``operation.name`` out of a ``batchAsyncGenerateVideo*`` response.
+
+    Supports two shapes:
+
+    * **OLD** (Lite / Fast / Quality) — ``data.operations[].operation.name``.
+    * **NEW** (Low Priority — ``_low_priority`` / ``_relaxed`` models) —
+      ``data.workflows[].name``. Workflows don't have ``operation.name``;
+      callers that need to poll must also read ``primaryMediaId`` from
+      ``workflows[].metadata`` (see ``extract_video_workflows``).
+    """
     if not isinstance(resp, dict):
         return []
     data = resp.get("data")
     if not isinstance(data, dict):
         return []
-    ops = data.get("operations")
-    if not isinstance(ops, list):
-        return []
     names: list[str] = []
-    for op in ops:
-        if not isinstance(op, dict):
-            continue
-        inner = op.get("operation") if isinstance(op.get("operation"), dict) else None
-        if inner is None:
-            # Some variants inline the name at top level.
-            name = op.get("name")
-        else:
-            name = inner.get("name")
-        if isinstance(name, str) and name:
-            names.append(name)
+    ops = data.get("operations")
+    if isinstance(ops, list):
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            inner = op.get("operation") if isinstance(op.get("operation"), dict) else None
+            if inner is None:
+                # Some variants inline the name at top level.
+                name = op.get("name")
+            else:
+                name = inner.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    if names:
+        return names
+    # NEW workflow schema — `data.workflows[]` instead of `data.operations[]`.
+    workflows = data.get("workflows")
+    if isinstance(workflows, list):
+        for wf in workflows:
+            if not isinstance(wf, dict):
+                continue
+            name = wf.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
     return names
+
+
+def extract_video_workflows(resp: Any) -> list[dict[str, Any]]:
+    """Pull workflow entries out of a NEW-schema video submit response.
+
+    Returns ``[{"name": <workflow_name>, "primary_media_id": <uuid>}, ...]``.
+    Empty list when the response is OLD-schema (operations-based) or has no
+    workflows. Callers use this to drive media-endpoint polling — workflow
+    submits don't yield operations, so ``batchCheckAsync`` can't see them;
+    we poll ``/v1/media/<primaryMediaId>`` directly and read the inline MP4
+    bytes off ``video.encodedVideo`` once it lands.
+    """
+    if not isinstance(resp, dict):
+        return []
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return []
+    workflows = data.get("workflows")
+    if not isinstance(workflows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for wf in workflows:
+        if not isinstance(wf, dict):
+            continue
+        name = wf.get("name")
+        meta = wf.get("metadata") if isinstance(wf.get("metadata"), dict) else {}
+        primary = meta.get("primaryMediaId") if isinstance(meta, dict) else None
+        if isinstance(name, str) and name and isinstance(primary, str) and primary:
+            out.append({"name": name, "primary_media_id": primary})
+    return out
 
 
 def extract_video_operations(

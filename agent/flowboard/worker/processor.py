@@ -202,6 +202,10 @@ async def _handle_gen_video(params: dict) -> tuple[dict, Optional[str]]:
     op_names = dispatch.get("operation_names") or []
     if not op_names:
         return dispatch, "no_operations_returned"
+    # NEW low-priority models return workflows (`{name, primary_media_id}`)
+    # instead of operations; the SDK surfaces them on `dispatch["workflows"]`
+    # so we can route the poll to /v1/media/<id> instead of batchCheckAsync.
+    workflows = dispatch.get("workflows") or None
 
     poll_attempts = 0
     last_poll: dict = {}
@@ -222,7 +226,7 @@ async def _handle_gen_video(params: dict) -> tuple[dict, Optional[str]]:
     ):
         await asyncio.sleep(VIDEO_POLL_INTERVAL_S)
         poll_attempts += 1
-        last_poll = await sdk.check_async(op_names)
+        last_poll = await sdk.check_async(op_names, workflows=workflows)
         if last_poll.get("error"):
             continue
         for op in last_poll.get("operations") or []:
@@ -303,6 +307,25 @@ async def _handle_gen_video(params: dict) -> tuple[dict, Optional[str]]:
             media_service.ingest_urls(entries_with_urls)
         except Exception:  # noqa: BLE001
             logger.exception("auto-ingest from gen_video response failed")
+    # Workflow-mode (Low Priority) deliveries arrive inline as base64 MP4
+    # bytes on the `/v1/media/<id>` poll — there is no GCS URL to chase.
+    # Plant the bytes in the local cache directly so the `/media/<id>` route
+    # serves them like any URL-backed asset.
+    for entry in succeeded_entries:
+        if not isinstance(entry, dict):
+            continue
+        encoded = entry.get("encoded_video")
+        mid = entry.get("media_id")
+        if not isinstance(encoded, str) or not isinstance(mid, str):
+            continue
+        try:
+            import base64 as _b64
+            media_service.ingest_inline_bytes(
+                mid, _b64.b64decode(encoded, validate=False),
+                kind="video", mime="video/mp4",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("inline ingest from workflow-mode poll failed for %s", mid)
 
     partial_error: Optional[str] = None
     if op_errors:

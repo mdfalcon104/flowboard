@@ -110,6 +110,41 @@ def ingest_urls(urls: list[dict[str, Any]]) -> int:
     return touched
 
 
+def ingest_inline_bytes(
+    media_id: str, data: bytes, *, kind: str = "video", mime: str = "video/mp4"
+) -> bool:
+    """Cache pre-fetched media bytes and mark the Asset as locally available.
+
+    Used by workflow-mode video poll (Low Priority models) where Flow returns
+    base64-encoded MP4 inline on ``/v1/media/<id>`` instead of a signed GCS
+    URL. The bytes never traverse ``fetch_and_cache`` so we plant them here
+    and the existing ``/media/<id>`` route serves them like any other asset.
+    """
+    if not is_valid_media_id(media_id) or not data:
+        return False
+    ext = _EXT_BY_MIME.get(mime, ".mp4")
+    path = MEDIA_CACHE_DIR / f"{media_id}{ext}"
+    try:
+        path.write_bytes(data)
+    except OSError as exc:
+        logger.error("failed to write inline cache %s: %s", path, exc)
+        return False
+    with get_session() as s:
+        row = s.exec(
+            select(Asset).where(Asset.uuid_media_id == media_id)
+        ).first()
+        if row is None:
+            row = Asset(uuid_media_id=media_id, url=None, kind=kind)
+        row.local_path = str(path)
+        row.mime = mime
+        if not row.kind:
+            row.kind = kind
+        s.add(row)
+        s.commit()
+    logger.info("media: ingested %d inline bytes for %s", len(data), media_id)
+    return True
+
+
 async def fetch_and_cache(media_id: str) -> Optional[tuple[bytes, str, Path]]:
     """If the Asset has a URL and no cached file, fetch bytes, cache, return.
 

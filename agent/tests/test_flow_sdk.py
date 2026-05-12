@@ -13,6 +13,7 @@ from flowboard.services.flow_sdk import (
     extract_media_entries,
     extract_operation_names,
     extract_video_operations,
+    extract_video_workflows,
 )
 
 
@@ -697,6 +698,198 @@ def test_extract_inner_api_error_handles_status_only():
     """status >= 400 with no structured error body → still report failure."""
     err = _extract_inner_api_error({"status": 503, "data": {}})
     assert err == "API_503"
+
+
+# ── workflow-mode (Low Priority) video schema ─────────────────────────────
+# Some Veo checkpoints (e.g. ``veo_3_1_i2v_lite_low_priority``,
+# ``veo_3_1_i2v_s_fast_ultra_relaxed``) return ``data.workflows[]`` instead
+# of ``data.operations[]``, and the final MP4 is fetched inline as base64
+# from ``/v1/media/<id>`` rather than streamed off ``fifeUrl``. The SDK
+# auto-detects the schema and routes the poll accordingly.
+
+
+def _mp4_bytes(size: int = 64) -> bytes:
+    """Synthetic but valid-looking MP4: ``ftyp`` box at offset 4 (12+ bytes)."""
+    header = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00"
+    return header + b"\x00" * (size - len(header))
+
+
+def test_extract_operation_names_handles_workflow_schema():
+    """NEW Low Priority schema — ``workflows[]`` instead of ``operations[]``."""
+    resp = {
+        "data": {
+            "workflows": [
+                {"name": "wf-1", "metadata": {"primaryMediaId": "mid-1"}},
+                {"name": "wf-2", "metadata": {"primaryMediaId": "mid-2"}},
+            ]
+        }
+    }
+    assert extract_operation_names(resp) == ["wf-1", "wf-2"]
+
+
+def test_extract_video_workflows_returns_pairs():
+    resp = {
+        "data": {
+            "workflows": [
+                {"name": "wf-1", "metadata": {"primaryMediaId": "mid-1"}},
+                {"name": "wf-orphan", "metadata": {}},  # no primary → dropped
+                {"name": "wf-2", "metadata": {"primaryMediaId": "mid-2"}},
+            ]
+        }
+    }
+    assert extract_video_workflows(resp) == [
+        {"name": "wf-1", "primary_media_id": "mid-1"},
+        {"name": "wf-2", "primary_media_id": "mid-2"},
+    ]
+
+
+def test_extract_video_workflows_empty_on_old_schema():
+    """OLD operations-based schema must not be confused with workflow mode."""
+    resp = {"data": {"operations": [{"operation": {"name": "op-1"}}]}}
+    assert extract_video_workflows(resp) == []
+
+
+@pytest.mark.asyncio
+async def test_gen_video_surfaces_workflows_on_low_priority_response():
+    c = RecordingClient()
+    c.api_response = {
+        "status": 200,
+        "data": {
+            "workflows": [
+                {"name": "wf-uuid", "metadata": {"primaryMediaId": "primary-vid-1"}},
+            ],
+            "media": [{"name": "primary-vid-1"}],
+        },
+    }
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    out = await sdk.gen_video(
+        prompt="x", project_id="p", start_media_id="src",
+        paygate_tier="PAYGATE_TIER_TWO", video_quality="lite_relaxed",
+    )
+    assert out["operation_names"] == ["wf-uuid"]
+    assert out["workflows"] == [{"name": "wf-uuid", "primary_media_id": "primary-vid-1"}]
+    # Old "no_operations_in_response" path must NOT trigger on workflow shape.
+    assert "error" not in out
+
+
+@pytest.mark.asyncio
+async def test_check_async_workflow_mode_polls_media_endpoint():
+    """Workflow polling fetches ``/v1/media/<id>`` and reads base64 MP4 off
+    ``video.encodedVideo``. A response with valid ``ftyp`` magic → done."""
+    import base64 as _b64
+
+    class WorkflowClient(RecordingClient):
+        async def api_request(self, **kwargs):
+            self.api_calls.append(kwargs)
+            return {
+                "status": 200,
+                "data": {
+                    "video": {
+                        "encodedVideo": _b64.b64encode(_mp4_bytes()).decode(),
+                        "fifeUrl": "https://flow-content.google/video/primary-vid-1?sig=x",
+                    }
+                },
+            }
+
+    c = WorkflowClient()
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    out = await sdk.check_async(
+        ["wf-uuid"],
+        workflows=[{"name": "wf-uuid", "primary_media_id": "primary-vid-1"}],
+    )
+    ops = out["operations"]
+    assert len(ops) == 1
+    assert ops[0]["name"] == "wf-uuid"
+    assert ops[0]["done"] is True
+    assert ops[0]["media_entries"][0]["media_id"] == "primary-vid-1"
+    assert ops[0]["media_entries"][0]["mediaType"] == "video"
+    # The encoded video bytes ride along so the processor can plant them
+    # in the local cache (no GCS URL to fall back to).
+    assert "encoded_video" in ops[0]["media_entries"][0]
+    # GET against /v1/media/<id> — never POST batchCheckAsync for a workflow.
+    assert c.api_calls[0]["method"] == "GET"
+    assert "/v1/media/primary-vid-1" in c.api_calls[0]["url"]
+
+
+@pytest.mark.asyncio
+async def test_check_async_workflow_mode_partial_bytes_means_pending():
+    """During render Flow returns a small metadata payload (no ``ftyp``
+    magic). That must register as ``done=False`` so the worker keeps
+    polling — not a spurious success on a 0-byte file."""
+    import base64 as _b64
+
+    class WorkflowClient(RecordingClient):
+        async def api_request(self, **kwargs):
+            self.api_calls.append(kwargs)
+            return {
+                "status": 200,
+                "data": {
+                    "video": {"encodedVideo": _b64.b64encode(b"\x00" * 200).decode()}
+                },
+            }
+
+    c = WorkflowClient()
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    out = await sdk.check_async(
+        ["wf-uuid"],
+        workflows=[{"name": "wf-uuid", "primary_media_id": "primary-vid-1"}],
+    )
+    assert out["operations"][0]["done"] is False
+    assert out["operations"][0]["media_entries"] == []
+
+
+@pytest.mark.asyncio
+async def test_check_async_mixed_schemas_routes_correctly():
+    """A single batch can mix OLD operations and NEW workflows (e.g. when a
+    retry of a workflow op is re-dispatched as workflow). Operation names
+    must NOT be sent into the workflow poll and vice-versa."""
+    import base64 as _b64
+
+    class MixedClient(RecordingClient):
+        async def api_request(self, **kwargs):
+            self.api_calls.append(kwargs)
+            url = kwargs.get("url", "")
+            if "batchCheckAsync" in url:
+                return {
+                    "status": 200,
+                    "data": {
+                        "operations": [
+                            {
+                                "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+                                "operation": {
+                                    "name": "op-old",
+                                    "metadata": {"video": {"mediaId": "old-mid", "fifeUrl": "https://flow-content.google/video/old-mid?sig"}},
+                                },
+                            }
+                        ]
+                    },
+                }
+            # /v1/media/<id> path
+            return {
+                "status": 200,
+                "data": {
+                    "video": {
+                        "encodedVideo": _b64.b64encode(_mp4_bytes()).decode(),
+                        "fifeUrl": "https://flow-content.google/video/wf-mid?sig",
+                    }
+                },
+            }
+
+    c = MixedClient()
+    sdk = FlowSDK(client=c)  # type: ignore[arg-type]
+    out = await sdk.check_async(
+        ["op-old", "wf-uuid"],
+        workflows=[{"name": "wf-uuid", "primary_media_id": "wf-mid"}],
+    )
+    ops = out["operations"]
+    # Result preserves the input order, not the dispatch order.
+    assert [o["name"] for o in ops] == ["op-old", "wf-uuid"]
+    assert ops[0]["done"] is True
+    assert ops[1]["done"] is True
+    # OLD poll body must only include op-old (workflow uuid → would 400 on Flow).
+    old_call = next(c for c in c.api_calls if "batchCheckAsync" in c.get("url", ""))
+    bodies = old_call["body"]["operations"]
+    assert [b["operation"]["name"] for b in bodies] == ["op-old"]
 
 
 @pytest.mark.asyncio
